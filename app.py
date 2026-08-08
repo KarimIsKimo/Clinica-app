@@ -2,6 +2,8 @@ import streamlit as st
 from datetime import datetime
 import pandas as pd
 import requests
+import threading
+import queue
 
 # ============================================================
 # 1. CONFIGURATION
@@ -162,24 +164,34 @@ def push_cloud_data(data):
         return False, f"Save failed ({e.__class__.__name__}). Your changes are kept locally."
 
 
+def _background_push(data_snapshot, result_queue):
+    ok, err = push_cloud_data(data_snapshot)
+    ts = datetime.now().strftime('%H:%M:%S')
+    if ok:
+        result_queue.put(("ok", f"Synced at {ts}"))
+    else:
+        result_queue.put(("bad", err))
+
+
 def autosave():
     """
-    Fast path used after each field edit: pushes the current local state
-    directly, without re-fetching the cloud copy first. This halves the
-    network round-trip so typing/editing feels instant. The full
-    merge-safe save (fetch + merge + push) still runs on the manual
-    "SAVE NOW" button and on Refresh, which reconciles any conflicts.
+    Fire-and-forget auto-save: pushes a snapshot of the current local
+    state to the cloud on a background thread and returns immediately.
+    This is what makes edits feel instant — the UI never waits on the
+    network request. The result (success/failure) is picked up from a
+    queue and shown in the sync status bar on the next rerun. The full
+    merge-safe save (fetch + merge + push) still runs synchronously on
+    the manual "SAVE NOW" button and on Refresh.
     """
-    ok, err = push_cloud_data(st.session_state.clinic_data)
-    if ok:
-        st.session_state.dirty_keys = set()
-        st.session_state.sync_status = "ok"
-        st.session_state.sync_message = f"Synced at {datetime.now().strftime('%H:%M:%S')}"
-        st.session_state.data_loaded = True
-    else:
-        st.session_state.sync_status = "bad"
-        st.session_state.sync_message = err
-    return ok
+    snapshot = dict(st.session_state.clinic_data)
+    st.session_state.dirty_keys = set()
+    st.session_state.sync_status = "pending"
+    st.session_state.sync_message = "Saving…"
+    threading.Thread(
+        target=_background_push,
+        args=(snapshot, st.session_state.sync_queue),
+        daemon=True,
+    ).start()
 
 
 def save_to_cloud(silent=False):
@@ -244,7 +256,17 @@ if "clinic_data" not in st.session_state:
     st.session_state.data_loaded = False
     st.session_state.sync_status = "pending"
     st.session_state.sync_message = "Loading..."
+    st.session_state.sync_queue = queue.Queue()
     load_from_cloud(initial=True)
+
+# Pick up results from any background auto-saves that finished since the
+# last rerun (drain to the latest result if several queued up).
+while not st.session_state.sync_queue.empty():
+    _status, _message = st.session_state.sync_queue.get()
+    st.session_state.sync_status = _status
+    st.session_state.sync_message = _message
+    if _status == "ok":
+        st.session_state.data_loaded = True
 
 
 def update_entry(s_id):
@@ -339,7 +361,7 @@ with tab_manage:
             </div>
         """, unsafe_allow_html=True)
 
-        c1, c2, c3, c4, c5 = st.columns([3, 3, 2, 2, 1])
+        c1, c2, c3, c4, c5 = st.columns([3, 3, 2, 1, 1])
         with c1:
             st.text_input("Name", value=entry["name"], key=f"n_{s_id}", placeholder="Patient Name",
                           label_visibility="collapsed", on_change=update_entry, args=(s_id,),
